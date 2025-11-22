@@ -125,7 +125,8 @@ async def handle_voice(message: Message) -> None:
     voice_path: Path | None = None
 
     try:
-        await message.voice.download(destination=ogg_file)
+                await message.bot.download(message.voice.file_id, destination=ogg_file)
+
 
         wav_file = convert_voice_to_wav(ogg_file)
 
