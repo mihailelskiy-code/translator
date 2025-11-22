@@ -77,6 +77,20 @@ def recognize_speech(audio_path: Path) -> str:
         except sr.UnknownValueError:
             continue
     raise sr.UnknownValueError("Speech could not be recognized in supported languages")
+def main_menu():
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🇷🇺 → 🇩🇪", callback_data="ru_to_de"),
+            InlineKeyboardButton(text="🇩🇪 → 🇷🇺", callback_data="de_to_ru")
+        ],
+        [
+            InlineKeyboardButton(text="🎙 Голос → перевод", callback_data="voice_translate"),
+        ],
+        [
+            InlineKeyboardButton(text="ℹ️ Помощь", callback_data="help")
+        ]
+    ])
+    return keyboard
 
 
 async def handle_start(message: Message):
