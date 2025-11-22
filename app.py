@@ -1,3 +1,4 @@
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 import asyncio
 import logging
 import re
@@ -78,14 +79,12 @@ def recognize_speech(audio_path: Path) -> str:
     raise sr.UnknownValueError("Speech could not be recognized in supported languages")
 
 
-async def handle_start(message: Message) -> None:
-    help_text = (
-        "👋 Я переводчик между русским и немецким.\n\n"
-        "• Отправь текст на русском или немецком — переведу на противоположный язык.\n"
-        "• Отправь voice — распознаю, переведу и пришлю озвучку перевода кружком.\n"
-        "Работаю только в режиме 🇷🇺⇄🇩🇪."
+async def handle_start(message: Message):
+    text = (
+        "👋 Привет! Я переводчик 🇷🇺 ⇄ 🇩🇪\n\n"
+        "Выбери вариант в меню ниже:"
     )
-    await message.answer(help_text)
+    await message.answer(text, reply_markup=main_menu())
 
 
 async def handle_text(message: Message) -> None:
