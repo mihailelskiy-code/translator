@@ -3,3 +3,4 @@ deep-translator
 SpeechRecognition
 pydub
 gTTS
+aiohttp
