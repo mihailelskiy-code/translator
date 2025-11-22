@@ -13,11 +13,12 @@ from deep_translator import GoogleTranslator
 from gtts import gTTS
 from pydub import AudioSegment
 import speech_recognition as sr
+from aiohttp import web  # 👈 добавили
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Токен берём из переменной окружения BOT_TOKEN
+# Токен берём из переменной окружения BOT_TOKEN (Render → Environment)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN environment variable is not set")
@@ -28,7 +29,7 @@ recognizer = sr.Recognizer()
 
 
 def detect_language(text: str) -> str:
-    """Очень простой детектор языка: есть кириллица → ru, иначе → de."""
+    """Очень простой детектор: есть кириллица → ru, иначе → de."""
     return "ru" if re.search(r"[\u0400-\u04FF]", text) else "de"
 
 
@@ -144,12 +145,41 @@ def register_handlers(dp: Dispatcher) -> None:
     dp.message.register(handle_text, F.text)
 
 
+async def start_http_server() -> None:
+    """
+    Маленький HTTP-сервер, чтобы Render видел открытый порт.
+    Ничего не делает, просто отвечает "Bot is running".
+    """
+    async def handle(request):
+        return web.Response(text="Bot is running")
+
+    app = web.Application()
+    app.router.add_get("/", handle)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+
+    port = int(os.getenv("PORT", "10000"))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+
+    logging.info(f"HTTP server started on port {port}")
+
+    # держим таску живой
+    while True:
+        await asyncio.sleep(3600)
+
+
 async def main() -> None:
     bot = Bot(BOT_TOKEN)
     dp = Dispatcher()
     register_handlers(dp)
-    print("✅ Бот запущен")
+
+    # Запускаем HTTP-сервер и Telegram-бота параллельно
+    http_task = asyncio.create_task(start_http_server())
+    logging.info("✅ Bot started, polling Telegram...")
     await dp.start_polling(bot)
+    await http_task
 
 
 if __name__ == "__main__":
