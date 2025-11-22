@@ -1,0 +1,5 @@
+aiogram
+deep-translator
+SpeechRecognition
+pydub
+gTTS
