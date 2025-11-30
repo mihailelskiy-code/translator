@@ -1,53 +1,63 @@
-import asyncio
+# app.py
+import os
+import logging
+
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Update, Message
+from aiogram.types import Message, Update
 from fastapi import FastAPI, Request
 import uvicorn
-import os
+
+logging.basicConfig(level=logging.INFO)
 
 TOKEN = os.getenv("BOT_TOKEN")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # типа https://translator-4fkx.onrender.com/webhook
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # https://translator-4f7k.onrender.com/webhook
 
 bot = Bot(TOKEN)
 dp = Dispatcher()
 app = FastAPI()
 
 
-# ---------- Хендлеры ----------
+# ---------- Хендлеры бота ----------
 
 @dp.message(F.text)
-async def echo(message: Message):
-    await message.answer("Бот работает! Напиши голосовое — добавим позже.")
+async def echo_handler(message: Message):
+    await message.answer("Братик, я на Render и живой 😊")
 
 
-# ---------- Webhook обработчик ----------
+# ---------- HTTP маршруты ----------
+
+@app.get("/")
+async def root():
+    return {"status": "ok", "message": "translator bot running"}
+
 
 @app.post("/webhook")
 async def webhook_handler(request: Request):
+    """Сюда Telegram шлёт апдейты."""
     data = await request.json()
     update = Update(**data)
     await dp.feed_update(bot, update)
     return {"ok": True}
 
 
-# ---------- Render Startup ----------
+# ---------- События запуска/остановки ----------
 
 @app.on_event("startup")
-async def on_start():
-    print("Setting webhook to:", WEBHOOK_URL)
+async def on_startup():
+    logging.info(f"Setting webhook to {WEBHOOK_URL!r}")
     await bot.set_webhook(WEBHOOK_URL)
 
 
 @app.on_event("shutdown")
-async def on_stop():
+async def on_shutdown():
+    logging.info("Deleting webhook")
     await bot.delete_webhook()
 
-
-# ---------- Run ----------
 
 if __name__ == "__main__":
     uvicorn.run(
         "app:app",
         host="0.0.0.0",
-        port=int(os.environ.get("PORT", 10000))
+        port=int(os.environ.get("PORT", 10000)),
     )
+
