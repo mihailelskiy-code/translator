@@ -1,3 +1,6 @@
 aiogram
 fastapi
 uvicorn[standard]
+fastapi
+uvicorn[standard]
+httpx
