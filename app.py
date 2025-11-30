@@ -17,30 +17,31 @@ dp = Dispatcher()
 app = FastAPI()
 
 
-# ---------- Хендлеры бота ----------
+# ---------- handlers ----------
 
 @dp.message(F.text)
 async def echo_handler(message: Message):
     await message.answer("Братик, я на Render и живой 😊")
 
 
-# ---------- HTTP маршруты ----------
+# ---------- HTTP routes ----------
 
 @app.get("/")
 async def root():
     return {"status": "ok", "message": "translator bot running"}
 
 
+# Обрабатываем и /webhook, и /webhook/ на всякий случай
 @app.post("/webhook")
+@app.post("/webhook/")
 async def webhook_handler(request: Request):
-    """Сюда Telegram шлёт апдейты."""
     data = await request.json()
     update = Update(**data)
     await dp.feed_update(bot, update)
     return {"ok": True}
 
 
-# ---------- События запуска/остановки ----------
+# ---------- lifecycle ----------
 
 @app.on_event("startup")
 async def on_startup():
@@ -55,9 +56,4 @@ async def on_shutdown():
 
 
 if __name__ == "__main__":
-    uvicorn.run(
-        "app:app",
-        host="0.0.0.0",
-        port=int(os.environ.get("PORT", 10000)),
-    )
-
+    uvico
