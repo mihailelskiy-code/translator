@@ -1,6 +1,3 @@
 aiogram
-deep-translator
-SpeechRecognition
-pydub
-gTTS
-aiohttp
+fastapi
+uvicorn[standard]
