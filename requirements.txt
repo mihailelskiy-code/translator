@@ -1,3 +1,5 @@
-fastapi
-uvicorn[standard]
-httpx
+aiogram==3.13.1
+aiohttp
+speechrecognition
+gTTS
+requests
