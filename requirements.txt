@@ -1,14 +1,4 @@
-# Telegram Bot
-python-telegram-bot==13.15
-
-# Распознавание речи
-SpeechRecognition==3.10.4
-
-# Работа с аудио
-pydub==0.25.1
-
-# Синтез речи
-gTTS==2.5.3
-
-# HTTP запросы
-requests==2.31.0
+python-telegram-bot==20.7
+deep-translator
+SpeechRecognition
+pydub
