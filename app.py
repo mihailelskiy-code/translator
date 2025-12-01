@@ -1,8 +1,9 @@
 # app.py
 import os
-import logging
-import html
 import re
+import base64
+import logging
+from typing import Dict, Optional, Any, List
 
 from fastapi import FastAPI, Request
 import uvicorn
@@ -10,371 +11,401 @@ import httpx
 
 logging.basicConfig(level=logging.INFO)
 
+# ==== КОНФИГ ==== #
+
 TOKEN = os.getenv("BOT_TOKEN")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+
+if not TOKEN:
+    raise RuntimeError("BOT_TOKEN не найден в переменных окружения")
+
+if not OPENROUTER_API_KEY:
+    logging.warning("⚠ OPENROUTER_API_KEY не задан — распознавание голоса работать не будет")
+
 TELEGRAM_API = f"https://api.telegram.org/bot{TOKEN}"
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+# Модель для распознавания речи через OpenRouter
+OPENROUTER_MODEL = "google/gemini-flash-1.5-8b"
+
+# Режимы перевода
+MODE_AUTO = "auto"
+MODE_DE_RU = "de_ru"
+MODE_RU_DE = "ru_de"
+
+MODE_LABELS = {
+    MODE_AUTO: "Auto 🇩🇪↔🇷🇺",
+    MODE_DE_RU: "🇩🇪 → 🇷🇺",
+    MODE_RU_DE: "🇷🇺 → 🇩🇪",
+}
+
+# Память режимов на одного процесса (хватает для нашего бота)
+user_modes: Dict[int, str] = {}
 
 app = FastAPI()
 
-# Память режимов по chat_id: auto / de_ru / ru_de
-user_modes: dict[int, str] = {}
+
+# ==== ХЕЛПЕРЫ ДЛЯ TELEGRAM ==== #
+
+async def tg_request(method: str, payload: Dict[str, Any]) -> httpx.Response:
+    """Отправка метода в Telegram Bot API."""
+    url = f"{TELEGRAM_API}/{method}"
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.post(url, json=payload)
+    if resp.status_code != 200:
+        logging.error("Telegram API error %s %s: %s",
+                      method, resp.status_code, resp.text)
+    return resp
 
 
-# ----------------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ----------------- #
-
-def build_mode_keyboard(current: str | None = None) -> dict:
+def build_mode_keyboard(selected: str) -> Dict[str, Any]:
     """Инлайн-клавиатура выбора режима перевода."""
-    def mark(mode: str, text: str) -> str:
-        return f"✅ {text}" if current == mode else text
+    def btn(mode: str) -> Dict[str, str]:
+        prefix = "✅ " if mode == selected else ""
+        return {"text": prefix + MODE_LABELS[mode], "callback_data": mode}
 
-    keyboard = {
+    return {
         "inline_keyboard": [
-            [
-                {
-                    "text": mark("auto", "🤖 Auto 🇩🇪/🇷🇺"),
-                    "callback_data": "mode:auto",
-                }
-            ],
-            [
-                {
-                    "text": mark("de_ru", "🇩🇪 → 🇷🇺"),
-                    "callback_data": "mode:de_ru",
-                },
-                {
-                    "text": mark("ru_de", "🇷🇺 → 🇩🇪"),
-                    "callback_data": "mode:ru_de",
-                },
-            ],
+            [btn(MODE_AUTO)],
+            [btn(MODE_DE_RU), btn(MODE_RU_DE)],
         ]
     }
-    return keyboard
 
 
-def detect_ru(text: str) -> bool:
-    """Очень простая детекция: есть кириллица → считаем, что текст русский."""
+def is_russian(text: str) -> bool:
+    """Очень простой детектор русского языка по кириллице."""
     return bool(re.search(r"[А-Яа-яЁё]", text))
 
 
+# ==== ПЕРЕВОД (MyMemory) ==== #
+
 async def translate_text(text: str, mode: str) -> str:
     """
-    Перевод с помощью бесплатного API MyMemory.
-    mode: auto / de_ru / ru_de
+    Перевод через MyMemory:
+    - auto: RU→DE или DE→RU по языку входного текста
+    - ru_de: RU→DE
+    - de_ru: DE→RU
     """
-    if mode == "de_ru":
-        src, dst = "DE", "RU"
-    elif mode == "ru_de":
-        src, dst = "RU", "DE"
+    text = text.strip()
+    if not text:
+        return "Пустой текст, нечего переводить 🤷‍♂️"
+
+    if mode == MODE_RU_DE:
+        src, tgt = "ru", "de"
+    elif mode == MODE_DE_RU:
+        src, tgt = "de", "ru"
     else:  # auto
-        if detect_ru(text):
-            src, dst = "RU", "DE"
+        if is_russian(text):
+            src, tgt = "ru", "de"
         else:
-            src, dst = "DE", "RU"
+            src, tgt = "de", "ru"
 
     params = {
         "q": text,
-        "langpair": f"{src}|{dst}",
+        "langpair": f"{src}|{tgt}",
     }
+
+    url = "https://api.mymemory.translated.net/get"
 
     try:
         async with httpx.AsyncClient(timeout=20.0) as client:
-            r = await client.get("https://api.mymemory.translated.net/get", params=params)
-            data = r.json()
-            translated = data.get("responseData", {}).get("translatedText")
-            if not translated:
-                raise RuntimeError("No translatedText in response")
-            return translated
+            resp = await client.get(url, params=params)
+        data = resp.json()
+        translated = data.get("responseData", {}).get("translatedText")
+        if not translated:
+            raise ValueError("Нет translatedText в ответе")
+        return translated
     except Exception as e:
-        logging.exception(f"Translation error: {e}")
-        return "Не удалось перевести текст 😔"
+        logging.exception("Ошибка перевода через MyMemory: %s", e)
+        return "❌ Не удалось сделать перевод, попробуй ещё раз позже."
 
 
-async def tg_request(method: str, payload: dict):
-    """Упрощённый вызов Telegram Bot API (JSON POST)."""
-    async with httpx.AsyncClient(timeout=20.0) as client:
-        r = await client.post(f"{TELEGRAM_API}/{method}", json=payload)
-        if r.status_code != 200:
-            logging.error(f"Telegram API {method} failed: {r.status_code} {r.text}")
-        return r
+# ==== РАСПОЗНАВАНИЕ ГОЛОСА ЧЕРЕЗ OPENROUTER ==== #
 
-
-async def tg_send_audio(chat_id: int, audio_bytes: bytes, caption: str):
-    """Отправка mp3/ogg как audio в Telegram."""
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        files = {
-            "audio": ("translation.mp3", audio_bytes, "audio/mpeg"),
-        }
-        data = {
-            "chat_id": str(chat_id),
-            "caption": caption,
-        }
-        r = await client.post(f"{TELEGRAM_API}/sendAudio", data=data, files=files)
-        if r.status_code != 200:
-            logging.error(f"sendAudio failed: {r.status_code} {r.text}")
-        return r
-
-
-async def openai_transcribe(audio_bytes: bytes) -> str | None:
-    """Whisper STT: аудио → текст."""
-    if not OPENAI_API_KEY:
-        return None
-
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-    }
-
-    files = {
-        "file": ("audio.ogg", audio_bytes, "audio/ogg"),
-    }
-    data = {
-        "model": "whisper-1",
-        # язык можно не указывать, Whisper сам поймет
-    }
-
+async def download_telegram_file(file_id: str) -> Optional[bytes]:
+    """Скачиваем файл голосового сообщения из Telegram."""
     try:
-        async with httpx.AsyncClient(timeout=90.0) as client:
-            r = await client.post(
-                "https://api.openai.com/v1/audio/transcriptions",
-                headers=headers,
-                files=files,
-                data=data,
-            )
-            if r.status_code != 200:
-                logging.error(f"OpenAI STT error: {r.status_code} {r.text}")
-                return None
-            j = r.json()
-            return j.get("text")
+        # 1) Получаем путь к файлу
+        get_file_resp = await tg_request("getFile", {"file_id": file_id})
+        data = get_file_resp.json()
+        file_path = data.get("result", {}).get("file_path")
+        if not file_path:
+            logging.error("Не найден file_path в ответе getFile: %s", data)
+            return None
+
+        file_url = f"https://api.telegram.org/file/bot{TOKEN}/{file_path}"
+
+        # 2) Качаем файл
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            file_resp = await client.get(file_url)
+        if file_resp.status_code != 200:
+            logging.error("Ошибка скачивания файла %s: %s %s",
+                          file_url, file_resp.status_code, file_resp.text)
+            return None
+        return file_resp.content
     except Exception as e:
-        logging.exception(f"OpenAI STT exception: {e}")
+        logging.exception("Ошибка при скачивании файла из Telegram: %s", e)
         return None
 
 
-async def openai_tts(text: str) -> bytes | None:
-    """OpenAI TTS: текст → mp3 байты."""
-    if not OPENAI_API_KEY:
+async def transcribe_with_openrouter(audio_bytes: bytes, lang_hint: Optional[str] = None) -> Optional[str]:
+    """
+    Распознаём речь через OpenRouter (модель Gemini).
+    Отправляем audio как base64 + content type input_audio.
+    """
+    if not OPENROUTER_API_KEY:
         return None
+
+    b64_audio = base64.b64encode(audio_bytes).decode("utf-8")
+
+    # Подсказка для модели, на каком языке говорим
+    hint_text = ""
+    if lang_hint == "ru":
+        hint_text = "The audio is in Russian. Transcribe it in the original language."
+    elif lang_hint == "de":
+        hint_text = "The audio is in German. Transcribe it in the original language."
+    else:
+        hint_text = "Transcribe this Telegram voice message to plain text, keep the original language."
+
+    payload = {
+        "model": OPENROUTER_MODEL,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": hint_text,
+                    },
+                    {
+                        "type": "input_audio",
+                        "inputAudio": {
+                            "data": b64_audio,
+                            # Telegram voice обычно OGG/OPUS, но многие модели принимают "mp3"/"wav".
+                            # Если будут проблемы — позже можно перекодировать через ffmpeg.
+                            "format": "ogg",
+                        },
+                    },
+                ],
+            }
+        ],
+        "stream": False,
+    }
 
     headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json",
-    }
-    json_payload = {
-        "model": "gpt-4o-mini-tts",  # при необходимости можешь сменить модель
-        "voice": "alloy",
-        "input": text,
-        "format": "mp3",
+        # Не обязательно, но рекомендуется для OpenRouter
+        "HTTP-Referer": "https://github.com/mihailelskiy-code/translator",
+        "X-Title": "Telegram Translator Bot",
     }
 
     try:
-        async with httpx.AsyncClient(timeout=90.0) as client:
-            r = await client.post(
-                "https://api.openai.com/v1/audio/speech",
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            resp = await client.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                json=payload,
                 headers=headers,
-                json=json_payload,
             )
-            if r.status_code != 200:
-                logging.error(f"OpenAI TTS error: {r.status_code} {r.text}")
-                return None
-            return r.content
+
+        if resp.status_code != 200:
+            logging.error("OpenRouter STT error %s: %s", resp.status_code, resp.text)
+            return None
+
+        data = resp.json()
+        choice = data["choices"][0]["message"]["content"]
+
+        # content может быть строкой или списком частей
+        if isinstance(choice, str):
+            text = choice.strip()
+        elif isinstance(choice, list):
+            parts: List[str] = []
+            for part in choice:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    parts.append(part.get("text", ""))
+            text = " ".join(parts).strip()
+        else:
+            text = ""
+
+        if not text:
+            logging.error("Пустой текст из OpenRouter STT: %s", data)
+            return None
+
+        return text
     except Exception as e:
-        logging.exception(f"OpenAI TTS exception: {e}")
+        logging.exception("Ошибка при обращении к OpenRouter STT: %s", e)
         return None
 
 
-# ----------------- HTTP-МАРШРУТЫ ----------------- #
+# ==== FASTAPI HANDLERS ==== #
 
 @app.get("/")
-async def root():
+async def root() -> Dict[str, Any]:
     return {"status": "ok", "message": "translator bot running"}
 
 
 @app.api_route("/webhook", methods=["GET", "POST"])
-async def telegram_webhook(request: Request):
+async def telegram_webhook(request: Request) -> Dict[str, Any]:
     if request.method == "GET":
-        return {"ok": True}
+        # Чтобы браузер не видел 404, если зайти на URL вебхука
+        return {"ok": True, "message": "webhook endpoint"}
 
     data = await request.json()
-    logging.info(f"Update from Telegram: {data}")
+    logging.info("Update from Telegram: %s", data)
 
-    # 1) CALLBACK QUERY (кнопки режимов)
+    # --- Обработка callback-кнопок (смена режима) --- #
     if "callback_query" in data:
         cq = data["callback_query"]
-        cq_id = cq["id"]
-        message = cq.get("message", {})
-        chat = message.get("chat", {})
+        chat = cq.get("message", {}).get("chat", {}) or {}
         chat_id = chat.get("id")
-        cb_data = cq.get("data", "")
+        mode_from_btn = cq.get("data")
 
-        if chat_id is not None and cb_data.startswith("mode:"):
-            mode = cb_data.split(":", 1)[1]
-            if mode not in {"auto", "de_ru", "ru_de"}:
-                mode = "auto"
+        if chat_id and mode_from_btn in MODE_LABELS:
+            user_modes[chat_id] = mode_from_btn
+            kb = build_mode_keyboard(mode_from_btn)
 
-            user_modes[chat_id] = mode
-
+            # Обновим подпись под сообщением
+            await tg_request(
+                "editMessageReplyMarkup",
+                {
+                    "chat_id": chat_id,
+                    "message_id": cq["message"]["message_id"],
+                    "reply_markup": kb,
+                },
+            )
             await tg_request(
                 "answerCallbackQuery",
                 {
-                    "callback_query_id": cq_id,
-                    "text": f"Режим перевода: {mode}",
+                    "callback_query_id": cq["id"],
+                    "text": f"Режим: {MODE_LABELS[mode_from_btn]}",
                     "show_alert": False,
                 },
             )
 
-            await tg_request(
-                "sendMessage",
-                {
-                    "chat_id": chat_id,
-                    "text": "✅ Режим перевода обновлён.\n"
-                            "Напиши текст или отправь голос – я переведу.",
-                    "reply_markup": build_mode_keyboard(current=mode),
-                },
-            )
-
         return {"ok": True}
 
-    # 2) СООБЩЕНИЯ
+    # --- Обычное сообщение --- #
     message = data.get("message") or {}
     chat = message.get("chat") or {}
+    chat_id = chat.get("id")
+    if not chat_id:
+        return {"ok": True}
+
     text = message.get("text")
     voice = message.get("voice")
-    chat_id = chat.get("id")
 
-    if chat_id is None:
-        return {"ok": True}
+    # Режим по умолчанию
+    mode = user_modes.get(chat_id, MODE_AUTO)
+    kb = build_mode_keyboard(mode)
 
-    # команда /start
-    if text == "/start":
-        user_modes[chat_id] = "auto"
-
-        welcome = (
-            "Привет, Братик! 🧠\n\n"
-            "Я перевожу между 🇩🇪 немецким и 🇷🇺 русским.\n\n"
-            "1️⃣ Выбери режим перевода на кнопках ниже.\n"
-            "2️⃣ Отправь текст ИЛИ голосовое – я верну перевод.\n\n"
-            "По умолчанию включён режим 🤖 Auto: "
-            "если текст/голос на русском → перевожу на немецкий, "
-            "если на немецком → на русский."
+    # /start
+    if text and text.startswith("/start"):
+        user_modes[chat_id] = MODE_AUTO
+        kb = build_mode_keyboard(MODE_AUTO)
+        start_text = (
+            "Привет, Братик! 👋\n\n"
+            "Я бот-переводчик 🇩🇪↔🇷🇺.\n\n"
+            "• Пиши текст — я переведу.\n"
+            "• Отправляй голосовые — я распознаю и переведу.\n\n"
+            "Ниже можешь выбрать режим перевода:"
         )
-
         await tg_request(
             "sendMessage",
             {
                 "chat_id": chat_id,
-                "text": welcome,
-                "reply_markup": build_mode_keyboard(current="auto"),
+                "text": start_text,
+                "reply_markup": kb,
             },
         )
         return {"ok": True}
 
-    mode = user_modes.get(chat_id, "auto")
-
-    # ----- VOICE: голос → текст → перевод → TTS -----
-    if voice:
-        if not OPENAI_API_KEY:
-            await tg_request(
-                "sendMessage",
-                {
-                    "chat_id": chat_id,
-                    "text": "Для работы с голосом нужен OPENAI_API_KEY в переменных окружения 🚨",
-                },
-            )
-            return {"ok": True}
-
-        file_id = voice["file_id"]
-
-        # 1) Получаем file_path через getFile
-        file_res = await tg_request("getFile", {"file_id": file_id})
-        file_json = file_res.json()
-        file_path = file_json.get("result", {}).get("file_path")
-        if not file_path:
-            await tg_request(
-                "sendMessage",
-                {
-                    "chat_id": chat_id,
-                    "text": "Не смог получить файл от Telegram 😔",
-                },
-            )
-            return {"ok": True}
-
-        file_url = f"https://api.telegram.org/file/bot{TOKEN}/{file_path}"
-
-        # 2) Скачиваем аудио
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            audio_resp = await client.get(file_url)
-            if audio_resp.status_code != 200:
-                logging.error(f"Download voice failed: {audio_resp.status_code} {audio_resp.text}")
-                await tg_request(
-                    "sendMessage",
-                    {
-                        "chat_id": chat_id,
-                        "text": "Не удалось скачать голосовое из Telegram 😔",
-                    },
-                )
-                return {"ok": True}
-            audio_bytes = audio_resp.content
-
-        # 3) STT: аудио → текст
-        recognized = await openai_transcribe(audio_bytes)
-        if not recognized:
-            await tg_request(
-                "sendMessage",
-                {
-                    "chat_id": chat_id,
-                    "text": "Не удалось распознать речь 😔",
-                },
-            )
-            return {"ok": True}
-
-        # 4) Переводим распознанный текст
-        translated = await translate_text(recognized, mode)
-
-        # 5) TTS: перевод → голос
-        tts_audio = await openai_tts(translated)
-
-        # 6) Отправляем текст + (если получилось) аудио
-        orig_safe = html.escape(recognized)
-        tr_safe = html.escape(translated)
-
-        reply_text = f"<b>Оригинал (из голоса):</b>\n{orig_safe}\n\n<b>Перевод:</b>\n{tr_safe}"
-
-        await tg_request(
-            "sendMessage",
-            {
-                "chat_id": chat_id,
-                "text": reply_text,
-                "parse_mode": "HTML",
-                "reply_markup": build_mode_keyboard(current=mode),
-            },
-        )
-
-        if tts_audio:
-            await tg_send_audio(
-                chat_id,
-                tts_audio,
-                caption="🎧 Озвученный перевод",
-            )
-
-        return {"ok": True}
-
-    # ----- ТЕКСТ: как раньше -----
+    # --- Текст для перевода --- #
     if text:
         translated = await translate_text(text, mode)
-
-        orig_safe = html.escape(text)
-        tr_safe = html.escape(translated)
-
-        reply = f"<b>Оригинал:</b>\n{orig_safe}\n\n<b>Перевод:</b>\n{tr_safe}"
-
+        reply = (
+            f"🌐 Режим: {MODE_LABELS[mode]}\n\n"
+            f"📝 Оригинал:\n{text}\n\n"
+            f"🔁 Перевод:\n{translated}"
+        )
         await tg_request(
             "sendMessage",
             {
                 "chat_id": chat_id,
                 "text": reply,
-                "parse_mode": "HTML",
-                "reply_markup": build_mode_keyboard(current=mode),
+                "reply_markup": kb,
+            },
+        )
+        return {"ok": True}
+
+    # --- Голосовое --- #
+    if voice:
+        if not OPENROUTER_API_KEY:
+            await tg_request(
+                "sendMessage",
+                {
+                    "chat_id": chat_id,
+                    "text": "❌ Распознавание голоса временно недоступно (нет ключа OpenRouter).",
+                    "reply_markup": kb,
+                },
+            )
+            return {"ok": True}
+
+        await tg_request(
+            "sendMessage",
+            {
+                "chat_id": chat_id,
+                "text": "🎧 Обрабатываю голосовое, секунду...",
             },
         )
 
+        file_id = voice.get("file_id")
+        audio_bytes = await download_telegram_file(file_id)
+        if not audio_bytes:
+            await tg_request(
+                "sendMessage",
+                {
+                    "chat_id": chat_id,
+                    "text": "❌ Не удалось скачать аудио из Telegram.",
+                    "reply_markup": kb,
+                },
+            )
+            return {"ok": True}
+
+        # Подсказка модели, на каком языке говоришь
+        lang_hint = None
+        if mode == MODE_RU_DE:
+            lang_hint = "ru"
+        elif mode == MODE_DE_RU:
+            lang_hint = "de"
+
+        text_stt = await transcribe_with_openrouter(audio_bytes, lang_hint=lang_hint)
+        if not text_stt:
+            await tg_request(
+                "sendMessage",
+                {
+                    "chat_id": chat_id,
+                    "text": "❌ Не удалось распознать речь. Попробуй записать ещё раз.",
+                    "reply_markup": kb,
+                },
+            )
+            return {"ok": True}
+
+        translated = await translate_text(text_stt, mode)
+        reply_voice = (
+            f"🎙 Распознал:\n{text_stt}\n\n"
+            f"🌐 Режим: {MODE_LABELS[mode]}\n\n"
+            f"🔁 Перевод:\n{translated}"
+        )
+        await tg_request(
+            "sendMessage",
+            {
+                "chat_id": chat_id,
+                "text": reply_voice,
+                "reply_markup": kb,
+            },
+        )
+        return {"ok": True}
+
+    # Если ничего из интересного — просто ок
     return {"ok": True}
 
 
