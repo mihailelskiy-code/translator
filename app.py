@@ -1,417 +1,274 @@
-# app.py
-import os
-import re
-import base64
 import logging
-from typing import Dict, Optional, Any, List
+import os
+import tempfile
+import subprocess
+from pathlib import Path
+import json
 
-from fastapi import FastAPI, Request
-import uvicorn
-import httpx
+import requests
+import speech_recognition as sr
+from gtts import gTTS
 
-logging.basicConfig(level=logging.INFO)
+from aiogram import Bot, Dispatcher, F
+from aiogram.filters import CommandStart
+from aiogram.types import Message, FSInputFile
 
-# ==== КОНФИГ ==== #
+from aiohttp import web
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
-TOKEN = os.getenv("BOT_TOKEN")
+
+# ------------------------
+# НАСТРОЙКИ И ПЕРЕМЕННЫЕ
+# ------------------------
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 
-if not TOKEN:
-    raise RuntimeError("BOT_TOKEN не найден в переменных окружения")
-
+if not TELEGRAM_BOT_TOKEN:
+    raise RuntimeError("Не задан TELEGRAM_BOT_TOKEN в переменных окружения")
 if not OPENROUTER_API_KEY:
-    logging.warning("⚠ OPENROUTER_API_KEY не задан — распознавание голоса работать не будет")
+    raise RuntimeError("Не задан OPENROUTER_API_KEY в переменных окружения")
 
-TELEGRAM_API = f"https://api.telegram.org/bot{TOKEN}"
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+OPENROUTER_MODEL = "openai/gpt-4o-mini"
 
-# Модель для распознавания речи через OpenRouter
-OPENROUTER_MODEL = "qwen/qwen-2.5-audio"
+WEBHOOK_PATH = "/webhook"
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "supersecret")
+BASE_WEBHOOK_URL = os.getenv("BASE_WEBHOOK_URL")  # напр. https://translator-47k.onrender.com
 
-# Режимы перевода
-MODE_AUTO = "auto"
-MODE_DE_RU = "de_ru"
-MODE_RU_DE = "ru_de"
-
-MODE_LABELS = {
-    MODE_AUTO: "Auto 🇩🇪↔🇷🇺",
-    MODE_DE_RU: "🇩🇪 → 🇷🇺",
-    MODE_RU_DE: "🇷🇺 → 🇩🇪",
-}
-
-# Память режимов в рамках одного процесса
-user_modes: Dict[int, str] = {}
-
-app = FastAPI()
+bot = Bot(TELEGRAM_BOT_TOKEN)
+dp = Dispatcher()
 
 
-# ==== ХЕЛПЕРЫ ДЛЯ TELEGRAM ==== #
+# ------------------------
+# УТИЛИТЫ ДЛЯ АУДИО
+# ------------------------
 
-async def tg_request(method: str, payload: Dict[str, Any]) -> httpx.Response:
-    """Отправка метода в Telegram Bot API."""
-    url = f"{TELEGRAM_API}/{method}"
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        resp = await client.post(url, json=payload)
-    if resp.status_code != 200:
-        logging.error("Telegram API error %s %s: %s",
-                      method, resp.status_code, resp.text)
-    return resp
-
-
-def build_mode_keyboard(selected: str) -> Dict[str, Any]:
-    """Инлайн-клавиатура выбора режима перевода."""
-    def btn(mode: str) -> Dict[str, str]:
-        prefix = "✅ " if mode == selected else ""
-        return {"text": prefix + MODE_LABELS[mode], "callback_data": mode}
-
-    return {
-        "inline_keyboard": [
-            [btn(MODE_AUTO)],
-            [btn(MODE_DE_RU), btn(MODE_RU_DE)],
-        ]
-    }
-
-
-def is_russian(text: str) -> bool:
-    """Очень простой детектор русского языка по кириллице."""
-    return bool(re.search(r"[А-Яа-яЁё]", text))
-
-
-# ==== ПЕРЕВОД (MyMemory) ==== #
-
-async def translate_text(text: str, mode: str) -> str:
+def convert_voice_to_wav(ogg_path: Path) -> Path:
     """
-    Перевод через MyMemory:
-    - auto: RU→DE или DE→RU по языку входного текста
-    - ru_de: RU→DE
-    - de_ru: DE→RU
+    Конвертируем OGG (Opus) от Telegram в WAV через ffmpeg.
     """
-    text = text.strip()
-    if not text:
-        return "Пустой текст, нечего переводить 🤷‍♂️"
-
-    if mode == MODE_RU_DE:
-        src, tgt = "ru", "de"
-    elif mode == MODE_DE_RU:
-        src, tgt = "de", "ru"
-    else:  # auto
-        if is_russian(text):
-            src, tgt = "ru", "de"
-        else:
-            src, tgt = "de", "ru"
-
-    params = {
-        "q": text,
-        "langpair": f"{src}|{tgt}",
-    }
-
-    url = "https://api.mymemory.translated.net/get"
-
-    try:
-        async with httpx.AsyncClient(timeout=20.0) as client:
-            resp = await client.get(url, params=params)
-        data = resp.json()
-        translated = data.get("responseData", {}).get("translatedText")
-        if not translated:
-            raise ValueError("Нет translatedText в ответе")
-        return translated
-    except Exception as e:
-        logging.exception("Ошибка перевода через MyMemory: %s", e)
-        return "❌ Не удалось сделать перевод, попробуй ещё раз позже."
+    wav_path = ogg_path.with_suffix(".wav")
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(ogg_path),
+        str(wav_path),
+    ]
+    logging.info("Запуск ffmpeg для конвертации в wav")
+    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return wav_path
 
 
-# ==== РАСПОЗНАВАНИЕ ГОЛОСА ЧЕРЕЗ OPENROUTER ==== #
-
-async def download_telegram_file(file_id: str) -> Optional[bytes]:
-    """Скачиваем файл голосового сообщения из Telegram."""
-    try:
-        # 1) Получаем путь к файлу
-        get_file_resp = await tg_request("getFile", {"file_id": file_id})
-        data = get_file_resp.json()
-        file_path = data.get("result", {}).get("file_path")
-        if not file_path:
-            logging.error("Не найден file_path в ответе getFile: %s", data)
-            return None
-
-        file_url = f"https://api.telegram.org/file/bot{TOKEN}/{file_path}"
-
-        # 2) Качаем файл
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            file_resp = await client.get(file_url)
-        if file_resp.status_code != 200:
-            logging.error("Ошибка скачивания файла %s: %s %s",
-                          file_url, file_resp.status_code, file_resp.text)
-            return None
-        return file_resp.content
-    except Exception as e:
-        logging.exception("Ошибка при скачивании файла из Telegram: %s", e)
-        return None
-
-
-async def transcribe_with_openrouter(audio_bytes: bytes, lang_hint: Optional[str] = None) -> Optional[str]:
+def recognize_speech(wav_path: Path) -> str:
     """
-    Распознаём речь через OpenRouter (модель qwen/qwen-2.5-audio).
-    Отправляем audio как base64 + content type input_audio.
+    Распознаём речь из WAV через speech_recognition.
+    Сначала пробуем русский, если не получилось — немецкий.
     """
-    if not OPENROUTER_API_KEY:
-        return None
+    recognizer = sr.Recognizer()
+    with sr.AudioFile(str(wav_path)) as source:
+        audio = recognizer.record(source)
 
-    b64_audio = base64.b64encode(audio_bytes).decode("utf-8")
+    for lang in ("ru-RU", "de-DE"):
+        try:
+            text = recognizer.recognize_google(audio, language=lang)
+            logging.info("STT успешно, язык: %s, текст: %s", lang, text)
+            return text
+        except sr.UnknownValueError:
+            logging.warning("STT: не распозналось на языке %s", lang)
+        except Exception as e:
+            logging.exception("STT ошибка на языке %s: %s", lang, e)
 
-    # Подсказка для модели, на каком языке говорим
-    hint_text = ""
-    if lang_hint == "ru":
-        hint_text = "The audio is in Russian. Transcribe it in the original language."
-    elif lang_hint == "de":
-        hint_text = "The audio is in German. Transcribe it in the original language."
-    else:
-        hint_text = "Transcribe this Telegram voice message to plain text, keep the original language."
+    return ""
 
-    payload = {
-        "model": OPENROUTER_MODEL,
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": hint_text,
-                    },
-                    {
-                        # формат, который ожидают аудио-модели OpenRouter
-                        "type": "input_audio",
-                        "input_audio": {
-                            "data": b64_audio,
-                            "format": "ogg",
-                        },
-                    },
-                ],
-            }
-        ],
-        "stream": False,
-    }
 
+def synthesize_speech(text: str, direction_flag: str) -> Path:
+    """
+    Озвучка текста через gTTS.
+    direction_flag: '🇷🇺→🇩🇪' или '🇩🇪→🇷🇺'
+    """
+    tts_lang = "de" if "🇷🇺" in direction_flag else "ru"
+
+    fd, path_str = tempfile.mkstemp(suffix=".mp3")
+    os.close(fd)
+    out_path = Path(path_str)
+
+    logging.info("Запуск gTTS, язык %s", tts_lang)
+    tts = gTTS(text=text, lang=tts_lang)
+    tts.save(str(out_path))
+
+    return out_path
+
+
+# ------------------------
+# ПЕРЕВОД ЧЕРЕЗ OPENROUTER
+# ------------------------
+
+def translate(text: str) -> tuple[str, str]:
+    """
+    Перевод текста через OpenRouter (openai/gpt-4o-mini).
+    Возвращает (перевод, направление_флагом).
+    """
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json",
-        # рекомендуется для OpenRouter
-        "HTTP-Referer": "https://github.com/mihailelskiy-code/translator",
-        "X-Title": "Telegram Translator Bot",
+        # Можно указать свои, но не обязательно:
+        "HTTP-Referer": "https://translator-bot.example",
+        "X-Title": "Telegram Voice Translator",
     }
 
+    system_prompt = (
+        "You are a professional translator between Russian and German. "
+        "Detect the language of the user's text. If it is Russian, "
+        "translate to German. If it is German, translate to Russian. "
+        "Answer ONLY as a JSON object with fields 'direction' and 'translation'. "
+        "Field 'direction' must be either 'ru-de' or 'de-ru'. "
+        "Do NOT add any extra text."
+    )
+
+    payload = {
+        "model": OPENROUTER_MODEL,
+        "response_format": {"type": "json_object"},
+        "temperature": 0.2,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": text},
+        ],
+    }
+
+    logging.info("Отправка запроса в OpenRouter для перевода")
+    resp = requests.post(OPENROUTER_URL, headers=headers, json=payload, timeout=60)
+    resp.raise_for_status()
+    data = resp.json()
+
+    content = data["choices"][0]["message"]["content"]
+    logging.info("Ответ OpenRouter (raw): %s", content)
+
     try:
-        async with httpx.AsyncClient(timeout=120.0) as client:
-            resp = await client.post(
-                "https://openrouter.ai/api/v1/chat/completions",
-                json=payload,
-                headers=headers,
-            )
+        obj = json.loads(content)
+        direction = obj.get("direction", "ru-de")
+        translation = obj.get("translation", "").strip()
+    except json.JSONDecodeError:
+        # если вдруг модель прислала невалидный json — считаем, что это просто текст
+        logging.warning("Не удалось распарсить JSON, вернул сырой текст")
+        direction = "ru-de"
+        translation = content.strip()
 
-        if resp.status_code != 200:
-            logging.error("OpenRouter STT error %s: %s", resp.status_code, resp.text)
-            return None
+    flag = "🇷🇺→🇩🇪" if direction == "ru-de" else "🇩🇪→🇷🇺"
+    return translation, flag
 
-        data = resp.json()
-        choice = data["choices"][0]["message"]["content"]
 
-        # content может быть строкой или списком частей
-        if isinstance(choice, str):
-            text = choice.strip()
-        elif isinstance(choice, list):
-            parts: List[str] = []
-            for part in choice:
-                if isinstance(part, dict) and part.get("type") == "text":
-                    parts.append(part.get("text", ""))
-            text = " ".join(parts).strip()
-        else:
-            text = ""
+# ------------------------
+# ХЕНДЛЕРЫ БОТА
+# ------------------------
 
-        if not text:
-            logging.error("Пустой текст из OpenRouter STT: %s", data)
-            return None
+@dp.message(CommandStart())
+async def cmd_start(message: Message):
+    await message.answer(
+        "Привет! 🎧\n"
+        "Я бот-переводчик голосовых.\n\n"
+        "Отправь мне голосовое сообщение на русском или немецком — "
+        "я распознаю, переведу и пришлю текст + озвучку."
+    )
 
-        logging.info("STT result: %s", text)
-        return text
+
+@dp.message(F.voice)
+async def handle_voice(message: Message):
+    note = await message.answer("🎧 Обрабатываю голосовое сообщение…")
+
+    ogg_file: Path | None = None
+    wav_file: Path | None = None
+    tts_file: Path | None = None
+
+    try:
+        # 1. Скачиваем voice из Telegram
+        fd, ogg_path_str = tempfile.mkstemp(suffix=".ogg")
+        os.close(fd)
+        ogg_file = Path(ogg_path_str)
+
+        await bot.download(message.voice.file_id, destination=ogg_file)
+        logging.info("Файл голосового скачан: %s", ogg_file)
+
+        # 2. Конвертация в WAV
+        wav_file = convert_voice_to_wav(ogg_file)
+
+        # 3. Распознавание речи
+        recognized_text = recognize_speech(wav_file)
+
+        if not recognized_text:
+            await note.edit_text("❌ Не удалось распознать речь. Попробуй ещё раз.")
+            return
+
+        await note.edit_text(f"🗣 Распознано:\n{recognized_text}")
+
+        # 4. Перевод через OpenRouter
+        translated, direction_flag = translate(recognized_text)
+
+        if not translated:
+            await message.answer("❌ Не удалось получить перевод.")
+            return
+
+        await message.answer(f"{direction_flag}\n{translated}")
+
+        # 5. Озвучка перевода
+        tts_file = synthesize_speech(translated, direction_flag)
+        voice = FSInputFile(str(tts_file))
+        await message.answer_audio(voice, caption="🔊 Озвучка перевода")
+
     except Exception as e:
-        logging.exception("Ошибка при обращении к OpenRouter STT: %s", e)
-        return None
+        logging.exception("Ошибка при обработке голосового: %s", e)
+        try:
+            await note.edit_text("❌ Произошла ошибка при обработке. Попробуй ещё раз.")
+        except Exception:
+            pass
+    finally:
+        # Чистим временные файлы
+        for f in (ogg_file, wav_file, tts_file):
+            if f and f.exists():
+                try:
+                    f.unlink()
+                except Exception:
+                    pass
 
 
-# ==== FASTAPI HANDLERS ==== #
+# ------------------------
+# WEBHOOK / AIOHTTP SERVER
+# ------------------------
 
-@app.get("/")
-async def root() -> Dict[str, Any]:
-    return {"status": "ok", "message": "translator bot running"}
+async def on_startup(app: web.Application):
+    if not BASE_WEBHOOK_URL:
+        logging.warning("BASE_WEBHOOK_URL не задан — вебхук не будет установлен автоматически.")
+        return
+
+    webhook_url = BASE_WEBHOOK_URL.rstrip("/") + WEBHOOK_PATH
+    logging.info("Устанавливаем webhook: %s", webhook_url)
+    await bot.set_webhook(
+        url=webhook_url,
+        secret_token=WEBHOOK_SECRET,
+        drop_pending_updates=True,
+    )
 
 
-@app.api_route("/webhook", methods=["GET", "POST"])
-async def telegram_webhook(request: Request) -> Dict[str, Any]:
-    if request.method == "GET":
-        # Чтобы браузер не видел 404, если зайти на URL вебхука
-        return {"ok": True, "message": "webhook endpoint"}
+def main():
+    app = web.Application()
+    SimpleRequestHandler(
+        dispatcher=dp,
+        bot=bot,
+        secret_token=WEBHOOK_SECRET,
+    ).register(app, path=WEBHOOK_PATH)
 
-    data = await request.json()
-    logging.info("Update from Telegram: %s", data)
+    setup_application(app, dp, bot=bot, on_startup=on_startup)
 
-    # --- Обработка callback-кнопок (смена режима) --- #
-    if "callback_query" in data:
-        cq = data["callback_query"]
-        chat = cq.get("message", {}).get("chat", {}) or {}
-        chat_id = chat.get("id")
-        mode_from_btn = cq.get("data")
-
-        if chat_id and mode_from_btn in MODE_LABELS:
-            user_modes[chat_id] = mode_from_btn
-            kb = build_mode_keyboard(mode_from_btn)
-
-            # Обновим клавиатуру под сообщением
-            await tg_request(
-                "editMessageReplyMarkup",
-                {
-                    "chat_id": chat_id,
-                    "message_id": cq["message"]["message_id"],
-                    "reply_markup": kb,
-                },
-            )
-            await tg_request(
-                "answerCallbackQuery",
-                {
-                    "callback_query_id": cq["id"],
-                    "text": f"Режим: {MODE_LABELS[mode_from_btn]}",
-                    "show_alert": False,
-                },
-            )
-
-        return {"ok": True}
-
-    # --- Обычное сообщение --- #
-    message = data.get("message") or {}
-    chat = message.get("chat") or {}
-    chat_id = chat.get("id")
-    if not chat_id:
-        return {"ok": True}
-
-    text = message.get("text")
-    voice = message.get("voice")
-
-    # Режим по умолчанию
-    mode = user_modes.get(chat_id, MODE_AUTO)
-    kb = build_mode_keyboard(mode)
-
-    # /start
-    if text and text.startswith("/start"):
-        user_modes[chat_id] = MODE_AUTO
-        kb = build_mode_keyboard(MODE_AUTO)
-        start_text = (
-            "Привет, Братик! 👋\n\n"
-            "Я бот-переводчик 🇩🇪↔🇷🇺.\n\n"
-            "• Пиши текст — я переведу.\n"
-            "• Отправляй голосовые — я распознаю и переведу.\n\n"
-            "Ниже можешь выбрать режим перевода:"
-        )
-        await tg_request(
-            "sendMessage",
-            {
-                "chat_id": chat_id,
-                "text": start_text,
-                "reply_markup": kb,
-            },
-        )
-        return {"ok": True}
-
-    # --- Текст для перевода --- #
-    if text:
-        translated = await translate_text(text, mode)
-        reply = (
-            f"🌐 Режим: {MODE_LABELS[mode]}\n\n"
-            f"📝 Оригинал:\n{text}\n\n"
-            f"🔁 Перевод:\n{translated}"
-        )
-        await tg_request(
-            "sendMessage",
-            {
-                "chat_id": chat_id,
-                "text": reply,
-                "reply_markup": kb,
-            },
-        )
-        return {"ok": True}
-
-    # --- Голосовое --- #
-    if voice:
-        if not OPENROUTER_API_KEY:
-            await tg_request(
-                "sendMessage",
-                {
-                    "chat_id": chat_id,
-                    "text": "❌ Распознавание голоса временно недоступно (нет ключа OpenRouter).",
-                    "reply_markup": kb,
-                },
-            )
-            return {"ok": True}
-
-        await tg_request(
-            "sendMessage",
-            {
-                "chat_id": chat_id,
-                "text": "🎧 Обрабатываю голосовое, секунду...",
-            },
-        )
-
-        file_id = voice.get("file_id")
-        audio_bytes = await download_telegram_file(file_id)
-        if not audio_bytes:
-            await tg_request(
-                "sendMessage",
-                {
-                    "chat_id": chat_id,
-                    "text": "❌ Не удалось скачать аудио из Telegram.",
-                    "reply_markup": kb,
-                },
-            )
-            return {"ok": True}
-
-        # Подсказка модели, на каком языке говоришь
-        lang_hint = None
-        if mode == MODE_RU_DE:
-            lang_hint = "ru"
-        elif mode == MODE_DE_RU:
-            lang_hint = "de"
-
-        text_stt = await transcribe_with_openrouter(audio_bytes, lang_hint=lang_hint)
-        if not text_stt:
-            await tg_request(
-                "sendMessage",
-                {
-                    "chat_id": chat_id,
-                    "text": "❌ Не удалось распознать речь. Попробуй записать ещё раз.",
-                    "reply_markup": kb,
-                },
-            )
-            return {"ok": True}
-
-        translated = await translate_text(text_stt, mode)
-        reply_voice = (
-            f"🎙 Распознал:\n{text_stt}\n\n"
-            f"🌐 Режим: {MODE_LABELS[mode]}\n\n"
-            f"🔁 Перевод:\n{translated}"
-        )
-        await tg_request(
-            "sendMessage",
-            {
-                "chat_id": chat_id,
-                "text": reply_voice,
-                "reply_markup": kb,
-            },
-        )
-        return {"ok": True}
-
-    # Если ничего интересного — просто ок
-    return {"ok": True}
+    port = int(os.getenv("PORT", 10000))
+    logging.info("Запуск aiohttp-сервера на порту %d", port)
+    web.run_app(app, host="0.0.0.0", port=port)
 
 
 if __name__ == "__main__":
-    uvicorn.run(
-        "app:app",
-        host="0.0.0.0",
-        port=int(os.environ.get("PORT", 10000)),
-    )
+    main()
