@@ -129,3 +129,20 @@ def translate(text: str) -> tuple[str, str]:
     logging.info("Запрос в OpenRouter…")
     resp = requests.post(OPENROUTER_URL, headers=headers, json=payload, timeout=60)
     resp.raise_for_status()
+def main():
+    app = web.Application()
+    SimpleRequestHandler(
+        dispatcher=dp,
+        bot=bot,
+        secret_token=WEBHOOK_SECRET,
+    ).register(app, path=WEBHOOK_PATH)
+
+    setup_application(app, dp, bot=bot, on_startup=on_startup)
+
+    port = int(os.getenv("PORT", 10000))
+    logging.info("Запуск сервера на 0.0.0.0:%d", port)
+    web.run_app(app, host="0.0.0.0", port=port)
+
+
+if __name__ == "__main__":
+    main()
