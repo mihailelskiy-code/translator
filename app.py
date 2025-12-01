@@ -25,7 +25,7 @@ if not OPENROUTER_API_KEY:
 TELEGRAM_API = f"https://api.telegram.org/bot{TOKEN}"
 
 # Модель для распознавания речи через OpenRouter
-OPENROUTER_MODEL = "google/gemini-flash-1.5-8b"
+OPENROUTER_MODEL = "qwen/qwen-2.5-audio"
 
 # Режимы перевода
 MODE_AUTO = "auto"
@@ -38,7 +38,7 @@ MODE_LABELS = {
     MODE_RU_DE: "🇷🇺 → 🇩🇪",
 }
 
-# Память режимов на одного процесса (хватает для нашего бота)
+# Память режимов в рамках одного процесса
 user_modes: Dict[int, str] = {}
 
 app = FastAPI()
@@ -149,7 +149,7 @@ async def download_telegram_file(file_id: str) -> Optional[bytes]:
 
 async def transcribe_with_openrouter(audio_bytes: bytes, lang_hint: Optional[str] = None) -> Optional[str]:
     """
-    Распознаём речь через OpenRouter (модель Gemini).
+    Распознаём речь через OpenRouter (модель qwen/qwen-2.5-audio).
     Отправляем audio как base64 + content type input_audio.
     """
     if not OPENROUTER_API_KEY:
@@ -177,11 +177,10 @@ async def transcribe_with_openrouter(audio_bytes: bytes, lang_hint: Optional[str
                         "text": hint_text,
                     },
                     {
+                        # формат, который ожидают аудио-модели OpenRouter
                         "type": "input_audio",
-                        "inputAudio": {
+                        "input_audio": {
                             "data": b64_audio,
-                            # Telegram voice обычно OGG/OPUS, но многие модели принимают "mp3"/"wav".
-                            # Если будут проблемы — позже можно перекодировать через ffmpeg.
                             "format": "ogg",
                         },
                     },
@@ -194,7 +193,7 @@ async def transcribe_with_openrouter(audio_bytes: bytes, lang_hint: Optional[str
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json",
-        # Не обязательно, но рекомендуется для OpenRouter
+        # рекомендуется для OpenRouter
         "HTTP-Referer": "https://github.com/mihailelskiy-code/translator",
         "X-Title": "Telegram Translator Bot",
     }
@@ -230,6 +229,7 @@ async def transcribe_with_openrouter(audio_bytes: bytes, lang_hint: Optional[str
             logging.error("Пустой текст из OpenRouter STT: %s", data)
             return None
 
+        logging.info("STT result: %s", text)
         return text
     except Exception as e:
         logging.exception("Ошибка при обращении к OpenRouter STT: %s", e)
@@ -263,7 +263,7 @@ async def telegram_webhook(request: Request) -> Dict[str, Any]:
             user_modes[chat_id] = mode_from_btn
             kb = build_mode_keyboard(mode_from_btn)
 
-            # Обновим подпись под сообщением
+            # Обновим клавиатуру под сообщением
             await tg_request(
                 "editMessageReplyMarkup",
                 {
@@ -405,7 +405,7 @@ async def telegram_webhook(request: Request) -> Dict[str, Any]:
         )
         return {"ok": True}
 
-    # Если ничего из интересного — просто ок
+    # Если ничего интересного — просто ок
     return {"ok": True}
 
 
