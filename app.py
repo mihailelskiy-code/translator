@@ -18,7 +18,7 @@ from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_applicati
 
 
 # -------------------------------------------------
-# CONFIG
+# НАСТРОЙКИ
 # -------------------------------------------------
 
 logging.basicConfig(
@@ -28,6 +28,8 @@ logging.basicConfig(
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+BASE_WEBHOOK_URL = os.getenv("BASE_WEBHOOK_URL")
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "supersecret")
 
 if not TELEGRAM_BOT_TOKEN:
     raise RuntimeError("Не задан TELEGRAM_BOT_TOKEN")
@@ -38,30 +40,32 @@ OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_MODEL = "openai/gpt-4o-mini"
 
 WEBHOOK_PATH = "/webhook"
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "supersecret")
-BASE_WEBHOOK_URL = os.getenv("BASE_WEBHOOK_URL")
 
 bot = Bot(TELEGRAM_BOT_TOKEN)
 dp = Dispatcher()
 
 
 # -------------------------------------------------
-# AUDIO UTILITIES
+# АУДИО: конвертация и распознавание
 # -------------------------------------------------
 
 def convert_voice_to_wav(ogg_path: Path) -> Path:
+    """Конвертация .ogg → .wav через ffmpeg"""
     wav_path = ogg_path.with_suffix(".wav")
     cmd = [
-        "ffmpeg", "-y",
-        "-i", str(ogg_path),
-        str(wav_path)
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(ogg_path),
+        str(wav_path),
     ]
-    logging.info("ffmpeg: converting ogg → wav")
+    logging.info("ffmpeg: конвертация %s → %s", ogg_path, wav_path)
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return wav_path
 
 
 def recognize_speech(wav_path: Path) -> str:
+    """Распознаём речь сначала как RU, потом как DE."""
     recognizer = sr.Recognizer()
     with sr.AudioFile(str(wav_path)) as source:
         audio = recognizer.record(source)
@@ -71,38 +75,52 @@ def recognize_speech(wav_path: Path) -> str:
             text = recognizer.recognize_google(audio, language=lang)
             logging.info("STT OK (%s): %s", lang, text)
             return text
-        except Exception:
-            logging.warning("STT failed for %s", lang)
+        except sr.UnknownValueError:
+            logging.warning("STT: не удалось распознать на %s", lang)
+        except Exception as e:
+            logging.exception("STT ошибка на %s: %s", lang, e)
 
     return ""
 
 
 def synthesize_speech(text: str, direction_flag: str) -> Path:
-    lang = "de" if "🇷🇺" in direction_flag else "ru"
+    """Озвучиваем перевод через gTTS."""
+    tts_lang = "de" if "🇷🇺" in direction_flag else "ru"
+
     fd, path_str = tempfile.mkstemp(suffix=".mp3")
     os.close(fd)
+    out_path = Path(path_str)
 
-    out = Path(path_str)
-    tts = gTTS(text, lang=lang)
-    tts.save(str(out))
-    return out
+    logging.info("gTTS: генерация голосового (%s)", tts_lang)
+    tts = gTTS(text=text, lang=tts_lang)
+    tts.save(str(out_path))
+
+    return out_path
 
 
 # -------------------------------------------------
-# TRANSLATION VIA OPENROUTER
+# ПЕРЕВОД через OpenRouter
 # -------------------------------------------------
 
 def translate(text: str) -> tuple[str, str]:
+    """
+    Отправляем текст в OpenRouter.
+    Возвращаем (перевод, флаг-направление).
+    """
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json",
-        "HTTP-Referer": "translator-bot",
+        "HTTP-Referer": "https://translator-bot.example",
+        "X-Title": "Telegram Voice Translator",
     }
 
     system_prompt = (
-        "Detect language (RU/DE). If RU → translate to DE. "
-        "If DE → translate to RU. Respond strictly as JSON: "
-        "{\"direction\": \"ru-de\"|\"de-ru\", \"translation\": \"...\"}"
+        "You are a professional translator between Russian and German. "
+        "Detect the language of the user's text. If it is Russian, "
+        "translate to German. If it is German, translate to Russian. "
+        "Answer ONLY as a JSON object with fields 'direction' and 'translation'. "
+        "Field 'direction' must be either 'ru-de' or 'de-ru'. "
+        "Do NOT add any extra text."
     )
 
     payload = {
@@ -115,96 +133,128 @@ def translate(text: str) -> tuple[str, str]:
         ],
     }
 
-    resp = requests.post(OPENROUTER_URL, headers=headers, json=payload, timeout=40)
+    logging.info("Запрос в OpenRouter…")
+    resp = requests.post(OPENROUTER_URL, headers=headers, json=payload, timeout=60)
     resp.raise_for_status()
+    data = resp.json()
 
-    raw = resp.json()["choices"][0]["message"]["content"]
+    content = data["choices"][0]["message"]["content"]
+    logging.info("Ответ OpenRouter (raw): %s", content)
 
     try:
-        obj = json.loads(raw)
-        direction = obj["direction"]
-        translation = obj["translation"]
-    except:
+        obj = json.loads(content)
+        direction = obj.get("direction", "ru-de")
+        translation = obj.get("translation", "").strip()
+    except json.JSONDecodeError:
+        logging.warning("JSON не распарсился, беру сырой текст")
         direction = "ru-de"
-        translation = raw
+        translation = content.strip()
 
     flag = "🇷🇺→🇩🇪" if direction == "ru-de" else "🇩🇪→🇷🇺"
     return translation, flag
 
 
 # -------------------------------------------------
-# TELEGRAM HANDLERS
+# ХЕНДЛЕРЫ TELEGRAM
 # -------------------------------------------------
 
 @dp.message(CommandStart())
-async def start(message: Message):
+async def cmd_start(message: Message):
     await message.answer(
-        "🎧 Привет! Я переводчик RU ⇄ DE.\n"
-        "Отправь голосовое — распознаю, переведу и озвучу."
+        "Привет! 🎧\n"
+        "Я бот-переводчик голосовых (RU ⇄ DE).\n\n"
+        "Отправь мне голосовое на русском или немецком — "
+        "я распознаю, переведу и пришлю текст + озвучку."
     )
 
 
 @dp.message(F.voice)
 async def handle_voice(message: Message):
+    note = await message.answer("🎧 Обрабатываю голосовое…")
 
-    note = await message.answer("⏳ Обрабатываю...")
-
-    ogg = None
-    wav = None
-    tts = None
+    ogg_file: Path | None = None
+    wav_file: Path | None = None
+    tts_file: Path | None = None
 
     try:
-        # Download
-        fd, tmpogg = tempfile.mkstemp(suffix=".ogg")
+        # 1. Скачиваем voice
+        fd, ogg_path_str = tempfile.mkstemp(suffix=".ogg")
         os.close(fd)
-        ogg = Path(tmpogg)
+        ogg_file = Path(ogg_path_str)
 
-        await bot.download(message.voice.file_id, ogg)
+        await bot.download(message.voice.file_id, destination=ogg_file)
+        logging.info("Голосовое скачано: %s", ogg_file)
 
-        # Convert
-        wav = convert_voice_to_wav(ogg)
+        # 2. Конвертация
+        wav_file = convert_voice_to_wav(ogg_file)
 
-        # STT
-        text = recognize_speech(wav)
-        await note.edit_text(f"🗣 Распознано: {text}")
+        # 3. STT
+        recognized_text = recognize_speech(wav_file)
+        if not recognized_text:
+            await note.edit_text("❌ Не удалось распознать речь. Попробуй ещё раз.")
+            return
 
-        # Translate
-        tr, flag = translate(text)
-        await message.answer(f"{flag}\n{tr}")
+        await note.edit_text(f"🗣 Распознано:\n{recognized_text}")
 
-        # TTS
-        tts = synthesize_speech(tr, flag)
-        await message.answer_audio(FSInputFile(str(tts)))
+        # 4. Перевод
+        translated, direction_flag = translate(recognized_text)
+        if not translated:
+            await message.answer("❌ Не удалось получить перевод.")
+            return
 
+        await message.answer(f"{direction_flag}\n{translated}")
+
+        # 5. Озвучка
+        tts_file = synthesize_speech(translated, direction_flag)
+        voice = FSInputFile(str(tts_file))
+        await message.answer_audio(voice, caption="🔊 Озвучка перевода")
+
+    except Exception as e:
+        logging.exception("Ошибка при обработке голосового: %s", e)
+        try:
+            await note.edit_text("❌ Произошла ошибка. Попробуй ещё раз.")
+        except Exception:
+            pass
     finally:
-        for f in [ogg, wav, tts]:
+        for f in (ogg_file, wav_file, tts_file):
             if f and f.exists():
                 try:
                     f.unlink()
-                except:
+                except Exception:
                     pass
 
 
 # -------------------------------------------------
-# WEBHOOK STARTUP
+# WEBHOOK + AIOHTTP
 # -------------------------------------------------
 
 async def on_startup(app: web.Application):
-    if BASE_WEBHOOK_URL:
-        url = BASE_WEBHOOK_URL.rstrip("/") + WEBHOOK_PATH
-        await bot.set_webhook(url=url, secret_token=WEBHOOK_SECRET)
-        logging.info("Webhook set: %s", url)
+    """Вызывается при старте приложения – ставим webhook в Telegram."""
+    if not BASE_WEBHOOK_URL:
+        logging.warning("BASE_WEBHOOK_URL не задан — webhook не будет установлен")
+        return
+
+    url = BASE_WEBHOOK_URL.rstrip("/") + WEBHOOK_PATH
+    logging.info("Устанавливаем webhook: %s", url)
+    await bot.set_webhook(
+        url=url,
+        secret_token=WEBHOOK_SECRET,
+        drop_pending_updates=True,
+    )
+    logging.info("Webhook set: %s", url)
 
 
 def main():
     app = web.Application()
 
+    # Регистрируем обработчик webhook'а
     SimpleRequestHandler(
         dispatcher=dp,
         bot=bot,
         secret_token=WEBHOOK_SECRET,
     ).register(app, path=WEBHOOK_PATH)
 
+    # Подключаем aiogram к aiohttp + on_startup
     setup_application(app, dp, bot=bot, on_startup=on_startup)
 
     port = int(os.getenv("PORT", 10000))
